@@ -33,7 +33,14 @@ jobs:
     needs: swift-version
     timeout-minutes: 30
     runs-on: ubuntu-24.04
-    container: ${{ needs.swift-version.outputs.image }}
+    container:
+      image: ${{ needs.swift-version.outputs.image }}
+      # CAP_SYS_ADMIN lets the network-namespace spawn tests create a namespace
+      # with `unshare --net`. setns(CLONE_NEWNET) requires it in both the
+      # caller's own user namespace and the one owning the target, so there is
+      # no unprivileged substitute. Without it those tests report as skipped
+      # and the coverage that matters most for that code never runs here.
+      options: --cap-add SYS_ADMIN
 
     steps:
       - name: Checkout repository

@@ -52,6 +52,12 @@ public final class CHVirtualMachineInstance: Sendable {
         public var initialFilesystem: Mount?
         public var bootLog: BootLog?
         public var extensions: [any Sendable] = []
+        /// Network namespace the cloud-hypervisor process should be spawned
+        /// in. Required when `interfaces` name taps that live outside this
+        /// process's namespace — CH resolves tap names locally, and
+        /// `TUNSETIFF` on a missing name creates a new unattached tap instead
+        /// of failing.
+        public var networkNamespace: NetworkNamespaceRef?
 
         public init() {
             self.cpus = 4
@@ -191,7 +197,8 @@ public final class CHVirtualMachineInstance: Sendable {
             config: .init(
                 binary: chBinary,
                 apiSocketPath: apiSocket,
-                bootLog: config.bootLog
+                bootLog: config.bootLog,
+                networkNamespace: config.networkNamespace
             ),
             logger: logger
         )

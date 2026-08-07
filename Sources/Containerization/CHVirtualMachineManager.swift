@@ -16,6 +16,7 @@
 
 #if os(Linux)
 import ContainerizationError
+import ContainerizationOS
 import Foundation
 import Logging
 import NIOCore
@@ -31,6 +32,7 @@ public struct CHVirtualMachineManager: VirtualMachineManager {
     private let chBinary: URL
     private let virtiofsdBinaryOverride: URL?
     private let runtimeRoot: URL
+    private let networkNamespace: NetworkNamespaceRef?
     private let group: (any EventLoopGroup)?
     private let logger: Logger?
 
@@ -53,6 +55,14 @@ public struct CHVirtualMachineManager: VirtualMachineManager {
     ///     runtime state.
     ///   - group: Optional shared NIO `EventLoopGroup`; if nil, each VM
     ///     spawns its own.
+    ///   - networkNamespace: Network namespace to spawn every VM's
+    ///     cloud-hypervisor process in; nil keeps them in this process's
+    ///     namespace. Needed whenever the interfaces handed to `create` name
+    ///     taps that live elsewhere — a CNI-prepared pod namespace, say.
+    ///     cloud-hypervisor resolves `NetConfig.tap` by name in its own
+    ///     namespace and `TUNSETIFF` *creates* an unattached tap when the
+    ///     name is missing, so getting this wrong yields a VM whose NIC comes
+    ///     up with no path to anything and no error anywhere.
     public init(
         kernel: Kernel,
         initialFilesystem: Mount,
@@ -60,6 +70,7 @@ public struct CHVirtualMachineManager: VirtualMachineManager {
         virtiofsdBinary: URL? = nil,
         runtimeRoot: URL? = nil,
         group: (any EventLoopGroup)? = nil,
+        networkNamespace: NetworkNamespaceRef? = nil,
         logger: Logger? = nil
     ) throws {
         self.kernel = kernel
@@ -88,6 +99,7 @@ public struct CHVirtualMachineManager: VirtualMachineManager {
         // looser mode.
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: runtimeRoot.path)
         self.runtimeRoot = runtimeRoot
+        self.networkNamespace = networkNamespace
         self.group = group
         self.logger = logger
     }
@@ -104,6 +116,7 @@ public struct CHVirtualMachineManager: VirtualMachineManager {
         instanceConfig.extensions = vmConfig.extensions
         instanceConfig.kernel = kernel
         instanceConfig.initialFilesystem = initialFilesystem
+        instanceConfig.networkNamespace = networkNamespace
 
         return try CHVirtualMachineInstance(
             group: group,

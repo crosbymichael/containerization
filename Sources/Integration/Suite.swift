@@ -195,7 +195,9 @@ struct IntegrationSuite: AsyncParsableCommand {
 
     static let eventLoop = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 
-    func bootstrap(_ testID: String) async throws -> (rootfs: Containerization.Mount, vmm: VirtualMachineManager, image: Containerization.Image, bootLog: BootLog) {
+    func bootstrap(_ testID: String, networkNamespace: NetworkNamespaceRef? = nil) async throws -> (
+        rootfs: Containerization.Mount, vmm: VirtualMachineManager, image: Containerization.Image, bootLog: BootLog
+    ) {
         let reference = "ghcr.io/linuxcontainers/alpine:3.20"
         let store = Self.imageStore
 
@@ -296,7 +298,8 @@ struct IntegrationSuite: AsyncParsableCommand {
             kernel: testKernel,
             initialFilesystem: initfsPerTest,
             chBinary: Self.chBinaryOverride(for: self),
-            virtiofsdBinary: Self.virtiofsdBinaryOverride(for: self)
+            virtiofsdBinary: Self.virtiofsdBinaryOverride(for: self),
+            networkNamespace: networkNamespace
         )
 
         return (
@@ -329,11 +332,14 @@ struct IntegrationSuite: AsyncParsableCommand {
         kernel: Kernel,
         initialFilesystem: Containerization.Mount,
         chBinary: String?,
-        virtiofsdBinary: String?
+        virtiofsdBinary: String?,
+        networkNamespace: NetworkNamespaceRef?
     ) throws -> any VirtualMachineManager {
         #if os(macOS)
         _ = chBinary
         _ = virtiofsdBinary
+        // Network namespaces are a Linux concept; VZ has no equivalent.
+        _ = networkNamespace
         return VZVirtualMachineManager(
             kernel: kernel,
             initialFilesystem: initialFilesystem,
@@ -346,6 +352,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             chBinary: chBinary.map { URL(fileURLWithPath: $0) },
             virtiofsdBinary: virtiofsdBinary.map { URL(fileURLWithPath: $0) },
             group: Self.eventLoop,
+            networkNamespace: networkNamespace,
             logger: log
         )
         #endif
@@ -626,6 +633,10 @@ struct IntegrationSuite: AsyncParsableCommand {
         let linuxOnlyTests: [Test] = [
             Test("pod hotplug block rootfs", testPodHotplugBlockRootfs),
             Test("pod hotplug virtiofs rootfs", testPodHotplugVirtiofsRootfs),
+
+            // Spawning the VMM inside a pre-existing network namespace is
+            // CH-only: VZ attaches interfaces through vmnet, not by tap name.
+            Test("CH process network namespace", testCHProcessNetworkNamespace),
         ]
         let tests: [Test] = crossPlatformTests + linuxOnlyTests
         #endif

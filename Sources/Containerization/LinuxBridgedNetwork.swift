@@ -31,6 +31,13 @@ import Foundation
 /// interchangeable from a `LinuxContainer`/`Network` consumer's POV.
 ///
 /// Requires `CAP_NET_ADMIN` for TAP creation and bridge enslavement.
+///
+/// The TAPs it creates live in the *calling* process's network namespace, so
+/// this is not compatible with `CHVirtualMachineManager(networkNamespace:)`:
+/// cloud-hypervisor would look for the tap by name inside the namespace it
+/// joined, not find it, and silently create an unattached one. Use one or the
+/// other — a caller-managed namespace with taps prepared inside it (CNI), or
+/// this type with the VMM left in the caller's namespace.
 public struct LinuxBridgedNetwork: Network {
     /// The IPv4 subnet from which container interfaces are allocated.
     public let subnet: CIDRv4

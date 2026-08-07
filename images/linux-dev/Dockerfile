@@ -131,3 +131,15 @@ RUN /tmp/build-musl-x86_64-deps.sh && rm /tmp/build-musl-x86_64-deps.sh
 # and cctl stay musl-static and link against /opt/cross-x86_64-musl/.
 COPY scripts/build-glibc-x86_64-deps.sh /tmp/build-glibc-x86_64-deps.sh
 RUN /tmp/build-glibc-x86_64-deps.sh && rm /tmp/build-glibc-x86_64-deps.sh
+
+# Test tooling
+# ---
+# `ip` (iproute2) is used by the integration suite's network-namespace test to
+# create a tap inside an unshared netns; `unshare` and `nsenter` come from
+# util-linux in the base image. Deliberately a trailing layer: adding test
+# tooling shouldn't invalidate the expensive cross-build layers above.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        iproute2 \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*

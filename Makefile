@@ -73,7 +73,20 @@ CLOUD_HYPERVISOR_SHA256 := bf004ddc1a148f47caa87ac49a783b8dbd6bf9bc27abe522ed197
 SWIFT_VERSION := $(shell cat $(ROOT_DIR)/.swift-version)
 SWIFT_SDK_URL := $(shell grep '^SWIFT_SDK_URL' vminitd/Makefile | head -1 | sed 's/.*:= *//')
 SWIFT_SDK_CHECKSUM := $(shell grep '^SWIFT_SDK_CHECKSUM' vminitd/Makefile | head -1 | sed 's/.*:= *//')
-LINUX_DEV_IMAGE := containerization-dev:$(SWIFT_VERSION)
+
+# Dev image tag is keyed on the content that goes into it, not just the Swift
+# version. `linux_run` only builds the image when the tag is missing, so a tag
+# that ignores the recipe means a change to the Dockerfile (a newly required
+# test tool, say) silently never reaches anyone with a warm image — and the
+# tests that need it quietly skip. Any edit to the recipe or the files it
+# copies in changes the tag, which forces exactly one rebuild.
+LINUX_DEV_IMAGE_INPUTS := images/linux-dev/Dockerfile \
+	$(wildcard images/linux-dev/wrappers/*) \
+	scripts/build-musl-x86_64-deps.sh \
+	scripts/build-glibc-x86_64-deps.sh
+LINUX_DEV_IMAGE_HASH := $(shell cat $(addprefix $(ROOT_DIR)/,$(LINUX_DEV_IMAGE_INPUTS)) 2>/dev/null | shasum -a 256 | cut -c1-12)
+LINUX_DEV_IMAGE := containerization-dev:$(SWIFT_VERSION)-$(LINUX_DEV_IMAGE_HASH)
+
 
 # Use an alternative path (backed by a named volume) for the build cache
 # when building products inside of a container
@@ -160,9 +173,25 @@ else
 	$(call linux_run,make containerization && make -C vminitd LIBC=$(LIBC) && make init)
 endif
 
+# Capabilities the dev container needs for the CH-in-a-netns coverage.
+#
+# CAP_SYS_ADMIN is required to create a network namespace (`unshare --net`) and
+# to setns into it — and it is genuinely required, not a convenience: setns
+# wants CAP_SYS_ADMIN in both the caller's own user namespace and the one
+# owning the target, so no unprivileged user-namespace detour substitutes for
+# it. CAP_NET_ADMIN is needed only by the integration suite, for the TUNSETIFF
+# that creates the tap inside the namespace and that cloud-hypervisor issues to
+# attach to it.
+#
+# Without these the affected tests report as skipped. Scoped to these
+# dev-container make targets on purpose — nothing in the library relaxes its
+# own capability defaults for this.
+LINUX_UNIT_CAPS := --cap-add CAP_SYS_ADMIN
+LINUX_INTEGRATION_CAPS := $(LINUX_UNIT_CAPS) --cap-add CAP_NET_ADMIN
+
 .PHONY: linux-test
 linux-test:
-	$(call linux_run,swift test $(SWIFT_CONFIGURATION) --scratch-path $(LINUX_SCRATCH_ROOT)/build-containerization)
+	$(call linux_run,swift test $(SWIFT_CONFIGURATION) --scratch-path $(LINUX_SCRATCH_ROOT)/build-containerization,$(LINUX_UNIT_CAPS))
 
 .PHONY: build-cloud-hypervisor
 # Build cloud-hypervisor from the patched source at .local/cloud-hypervisor and
@@ -267,7 +296,7 @@ ifeq (,$(wildcard bin/initfs.ext4))
 	@echo "missing bin/initfs.ext4; run 'make init' first (this also seeds the persistent imageStore at .local/integration-cache)"
 	@exit 1
 endif
-	$(call linux_run,CONTAINERIZATION_RELAXED_SANDBOX=1 ./bin/containerization-integration --kernel ./$(LINUX_INTEGRATION_KERNEL) --ch-binary ./bin/cloud-hypervisor --virtiofsd-binary ./bin/virtiofsd --max-concurrency 1 $(linux_integration_filter),--kernel $(LINUX_INTEGRATION_KERNEL) --virtualization)
+	$(call linux_run,CONTAINERIZATION_RELAXED_SANDBOX=1 ./bin/containerization-integration --kernel ./$(LINUX_INTEGRATION_KERNEL) --ch-binary ./bin/cloud-hypervisor --virtiofsd-binary ./bin/virtiofsd --max-concurrency 1 $(linux_integration_filter),--kernel $(LINUX_INTEGRATION_KERNEL) --virtualization $(LINUX_INTEGRATION_CAPS))
 
 # Builds the x86_64 deployment tarball.
 #

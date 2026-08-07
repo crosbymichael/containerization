@@ -46,6 +46,16 @@
 #define CLOSE_RANGE_CLOEXEC 0x4
 #endif
 
+#if defined(__linux__)
+// setns(2) and CLONE_NEWNET are both gated behind _GNU_SOURCE in glibc and
+// musl, which this translation unit does not define. Declare them the same
+// way vminitd's LCShim does rather than reordering the includes.
+extern int setns(int fd, int nstype);
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET 0x40000000
+#endif
+#endif
+
 static int mark_cloexec(int fd) {
     int flags = fcntl(fd, F_GETFD);
 
@@ -103,6 +113,7 @@ void exec_command_attrs_init(struct exec_command_attrs *attrs) {
   attrs->gid = -1;
   attrs->pdeathSignal = 0;
   attrs->setfgpgrp = 0;
+  attrs->netns_fd = -1;
 }
 
 static void child_handler(const int sync_pipes[2], const char *executable,
@@ -122,6 +133,31 @@ static void child_handler(const int sync_pipes[2], const char *executable,
   if (close(sync_pipes[0]) < 0) {
     goto fail;
   }
+
+#if defined(__linux__)
+  // Join the requested network namespace first, ahead of everything else in
+  // the child. Two orderings matter:
+  //
+  //   * before the fd shuffle below. That shuffle relocates the sync pipe to
+  //     max(file_handles)+1 and then dup2()s the handles onto
+  //     0..file_handle_count, so it can land on netns_fd and silently replace
+  //     it. With a path-supplied namespace this is the common case, not a
+  //     corner: the fd is opened right after the stdio handles, which puts it
+  //     at exactly the number the sync pipe relocates to.
+  //   * before the setgid/setreuid drop further down, because
+  //     setns(CLONE_NEWNET) needs CAP_SYS_ADMIN both in the user namespace
+  //     that owns the target namespace and in our own current one.
+  //
+  // A failure here must never fall through to execve. Running the workload
+  // in the caller's namespace instead of the requested one is silent — e.g.
+  // TUNSETIFF on a tap name that doesn't exist locally creates a fresh,
+  // unattached tap rather than failing — so report and exit instead.
+  if (attrs.netns_fd >= 0) {
+    if (setns(attrs.netns_fd, CLONE_NEWNET) != 0) {
+      goto fail;
+    }
+  }
+#endif
 
   // Setup process group and foreground before clearing signal mask.
   if (attrs.setpgid) {
@@ -308,10 +344,22 @@ fail:
   err = errno;
   if (err) {
     // send our error to the parent
-    while (write(syncfd, &err, sizeof(err)) < 0)
-      ;
+    while (write(syncfd, &err, sizeof(err)) < 0) {
+      // Only a signal interruption is worth retrying. Every other error
+      // (EPIPE when the parent is gone, EBADF) is permanent, and all signals
+      // are still blocked here — the child's mask isn't cleared until after
+      // this point — so retrying forever would spin a core rather than die.
+      if (errno != EINTR) {
+        break;
+      }
+    }
   }
-  exit(127);
+  // _exit, not exit: this is the child of a fork in a multithreaded host, so
+  // running the parent's atexit handlers or flushing its inherited stdio
+  // buffers can deadlock on a lock held by another thread at fork time. The
+  // parent's waitpid below has no timeout, so that deadlock would hang the
+  // caller's start() forever.
+  _exit(127);
 }
 
 int exec_command(pid_t *result, const char *executable, char *const args[],
@@ -345,7 +393,9 @@ int exec_command(pid_t *result, const char *executable, char *const args[],
     // hand off to child
     child_handler(sync_pipe, executable, args, envp, file_handles,
                   file_handle_count, working_directory, old_mask, *attrs);
-    exit(EXIT_FAILURE);
+    // Unreachable — child_handler always _exits. Still _exit and not exit,
+    // for the same fork-in-a-multithreaded-host reason.
+    _exit(EXIT_FAILURE);
   }
 
   // handle parent operations
@@ -384,7 +434,12 @@ fail:
     printf("restoring signal mask: %s\n", strerror(errno));
   }
   if (err) {
-    printf("exec_command execve: %s\n", strerror(err));
+    // Restore the child's errno here, not where it was captured: the
+    // waitpid/close/printf calls between then and now can each overwrite it
+    // (a concurrent reaper makes that waitpid return ECHILD, for instance),
+    // and the caller reads errno to build its error.
+    errno = err;
+    printf("exec_command child: %s\n", strerror(err));
     return -1;
   }
   return 0;

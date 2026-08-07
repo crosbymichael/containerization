@@ -42,6 +42,12 @@ struct exec_command_attrs {
   int pdeathSignal;
   /// make the new process group the foreground process group
   int setfgpgrp;
+  /// file descriptor referring to a network namespace, either
+  /// /proc/<pid>/ns/net or a bind mount of one. The child joins it with
+  /// setns(2) before it execs; -1 leaves the child in the caller's network
+  /// namespace. Ownership stays with the caller. Linux only; ignored
+  /// elsewhere.
+  int netns_fd;
 };
 
 void exec_command_attrs_init(struct exec_command_attrs *attrs);

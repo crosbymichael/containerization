@@ -38,6 +38,11 @@ final class CHProcess: Sendable {
         let binary: URL
         let apiSocketPath: URL
         let bootLog: BootLog?
+        /// Network namespace to spawn the VMM in. cloud-hypervisor resolves
+        /// `NetConfig.tap` by name against whatever namespace it is running
+        /// in, so a tap living in a CNI-prepared pod namespace is only
+        /// reachable if the VMM itself is in that namespace.
+        let networkNamespace: NetworkNamespaceRef?
     }
 
     enum ExitReason: Sendable, Equatable {
@@ -94,11 +99,33 @@ final class CHProcess: Sendable {
         // the parent before our own teardown ladder (terminate → wait) gets
         // a chance to run an orderly shutdown.
         command.attrs.setsid = true
+        // Join the caller-supplied network namespace, if any. Applied to the
+        // VMM only: virtiofsd talks to CH over unix sockets by path, so it
+        // has no namespace requirement and keeps spawning where we are.
+        //
+        // The child does the setns(2) itself, so this process — and every
+        // other subprocess it spawns — stays put.
+        if let networkNamespace = config.networkNamespace {
+            command.attrs.networkNamespace = networkNamespace
+            logger?.debug("cloud-hypervisor joining network namespace \(networkNamespace)")
+        }
 
         do {
             try command.start()
         } catch {
             try? logHandle?.close()
+            if let networkNamespace = config.networkNamespace {
+                // A spawn failure with a namespace in play is most often the
+                // namespace's fault (EPERM without CAP_SYS_ADMIN, EINVAL or
+                // EBADF on a stale reference), and all that crosses the
+                // fork/exec boundary is an errno. Name the namespace so the
+                // error points at the cause rather than at cloud-hypervisor.
+                throw ContainerizationError(
+                    .internalError,
+                    message: "failed to spawn cloud-hypervisor in network namespace \(networkNamespace)",
+                    cause: error
+                )
+            }
             throw error
         }
 

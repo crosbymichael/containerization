@@ -29,6 +29,39 @@ import Glibc
 private let _kill = Glibc.kill
 #endif
 
+/// A reference to a Linux network namespace for a child process to join.
+///
+/// The namespace is entered in the child between `fork` and `execve`, so the
+/// calling process never changes its own namespace — a `setns` on the parent
+/// would leak into every subsequent spawn.
+public enum NetworkNamespaceRef: Sendable {
+    /// An already-open file descriptor referring to a network namespace.
+    /// The caller keeps ownership: it is neither duplicated nor closed.
+    ///
+    /// The fd must stay open for as long as this reference may be used to
+    /// spawn. Closing it frees the number for reuse, and if an unrelated
+    /// `open` recycles it onto *another* namespace fd the spawn joins the
+    /// wrong namespace and reports success. Prefer `.path` for anything
+    /// long-lived (a `VirtualMachineManager` that spawns per VM, say), where
+    /// the fd is opened fresh for each spawn.
+    case fd(Int32)
+    /// A path to a network namespace, either `/proc/<pid>/ns/net` or a bind
+    /// mount of one such as `/var/run/netns/<name>`. Opened before the spawn
+    /// and closed again once it completes.
+    case path(String)
+}
+
+extension NetworkNamespaceRef: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .fd(let fd):
+            return "fd \(fd)"
+        case .path(let path):
+            return path
+        }
+    }
+}
+
 /// Use a command to run an executable.
 public struct Command: Sendable {
     /// Path to the executable binary.
@@ -72,6 +105,12 @@ public struct Command: Sendable {
         public var gid: UInt32?
         /// Signal to send when parent process dies (Linux only).
         public var pdeathSignal: Int32?
+        /// Network namespace for the child to join before it execs (Linux
+        /// only; setting it elsewhere throws `Error.networkNamespaceUnsupported`).
+        /// Requires CAP_SYS_ADMIN, and is applied before `uid`/`gid` are
+        /// dropped. If the namespace can't be joined the spawn fails rather
+        /// than running the process in the caller's namespace.
+        public var networkNamespace: NetworkNamespaceRef?
 
         public init(
             setPGroup: Bool = false,
@@ -83,7 +122,8 @@ public struct Command: Sendable {
             setctty: Bool = false,
             uid: UInt32? = nil,
             gid: UInt32? = nil,
-            pdeathSignal: Int32? = nil
+            pdeathSignal: Int32? = nil,
+            networkNamespace: NetworkNamespaceRef? = nil
         ) {
             self.setPGroup = setPGroup
             self.setForegroundPGroup = setForegroundPGroup
@@ -95,6 +135,7 @@ public struct Command: Sendable {
             self.uid = uid
             self.gid = gid
             self.pdeathSignal = pdeathSignal
+            self.networkNamespace = networkNamespace
         }
     }
 
@@ -132,11 +173,17 @@ public struct Command: Sendable {
 extension Command {
     public enum Error: Swift.Error, CustomStringConvertible {
         case processRunning
+        case networkNamespaceUnsupported
+        case invalidNetworkNamespaceFD(Int32)
 
         public var description: String {
             switch self {
             case .processRunning:
                 return "the process is already running"
+            case .networkNamespaceUnsupported:
+                return "joining a network namespace is only supported on Linux"
+            case .invalidNetworkNamespaceFD(let fd):
+                return "\(fd) is not a valid network namespace file descriptor"
             }
         }
     }
@@ -221,6 +268,44 @@ extension Command {
         if let pdeathSignal = self.attrs.pdeathSignal {
             attrs.pdeathSignal = pdeathSignal
         }
+
+        // The child joins the network namespace itself, between fork and exec,
+        // so this process stays in its own namespace. A path is opened here in
+        // the parent and closed once the spawn returns; an fd is passed
+        // through untouched and remains the caller's to close. O_CLOEXEC is
+        // correct either way: the fd is only used before execve.
+        #if os(Linux)
+        var openedNamespaceFD: Int32?
+        defer {
+            if let openedNamespaceFD {
+                close(openedNamespaceFD)
+            }
+        }
+        if let namespace = self.attrs.networkNamespace {
+            switch namespace {
+            case .fd(let fd):
+                // A negative fd is the C layer's "no namespace" sentinel, and
+                // -1 is exactly what a failed open() hands back. Accepting it
+                // would spawn in the caller's namespace and say nothing —
+                // the silent misconfiguration this option exists to prevent.
+                guard fd >= 0 else {
+                    throw Error.invalidNetworkNamespaceFD(fd)
+                }
+                attrs.netns_fd = fd
+            case .path(let path):
+                let fd = open(path, O_RDONLY | O_CLOEXEC)
+                guard fd >= 0 else {
+                    throw POSIXError.fromErrno()
+                }
+                openedNamespaceFD = fd
+                attrs.netns_fd = fd
+            }
+        }
+        #else
+        guard self.attrs.networkNamespace == nil else {
+            throw Error.networkNamespaceUnsupported
+        }
+        #endif
 
         var pid: pid_t = 0
         var argv = ([executable] + arguments).map { strdup($0) } + [nil]
